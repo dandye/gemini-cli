@@ -245,6 +245,7 @@ export function mergeSettings(
   user: Settings,
   workspace: Settings,
   isTrusted: boolean,
+  envOverrides: Settings = {},
 ): MergedSettings {
   const safeWorkspace = isTrusted ? workspace : ({} as Settings);
   const schemaDefaults = getDefaultsFromSchema();
@@ -256,6 +257,7 @@ export function mergeSettings(
   // 3. User Settings
   // 4. Workspace Settings
   // 5. System Settings (as overrides)
+  // 6. Environment Variable Overrides
   // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
   return customDeepMerge(
     getMergeStrategyForPath,
@@ -264,6 +266,7 @@ export function mergeSettings(
     user,
     safeWorkspace,
     system,
+    envOverrides,
   ) as MergedSettings;
 }
 
@@ -294,6 +297,7 @@ export interface LoadedSettingsSnapshot {
   systemDefaults: SettingsFile;
   user: SettingsFile;
   workspace: SettingsFile;
+  envOverrides: Settings;
   isTrusted: boolean;
   errors: SettingsError[];
   merged: MergedSettings;
@@ -307,6 +311,7 @@ export class LoadedSettings {
     workspace: SettingsFile,
     isTrusted: boolean,
     errors: SettingsError[] = [],
+    envOverrides: Settings = {},
   ) {
     this.system = system;
     this.systemDefaults = systemDefaults;
@@ -317,6 +322,7 @@ export class LoadedSettings {
       ? workspace
       : this.createEmptyWorkspace(workspace);
     this.errors = errors;
+    this.envOverrides = envOverrides;
     this._merged = this.computeMergedSettings();
     this._snapshot = this.computeSnapshot();
   }
@@ -325,6 +331,7 @@ export class LoadedSettings {
   readonly systemDefaults: SettingsFile;
   readonly user: SettingsFile;
   workspace: SettingsFile;
+  readonly envOverrides: Settings;
   isTrusted: boolean;
   readonly errors: SettingsError[];
 
@@ -364,6 +371,7 @@ export class LoadedSettings {
       this.user.settings,
       this.workspace.settings,
       this.isTrusted,
+      this.envOverrides,
     );
 
     // Remote admin settings always take precedence and file-based admin settings
@@ -397,6 +405,7 @@ export class LoadedSettings {
       systemDefaults: cloneSettingsFile(this.systemDefaults),
       user: cloneSettingsFile(this.user),
       workspace: cloneSettingsFile(this.workspace),
+      envOverrides: structuredClone(this.envOverrides),
       isTrusted: this.isTrusted,
       errors: [...this.errors],
       merged: structuredClone(this._merged),
@@ -488,7 +497,11 @@ export class LoadedSettings {
   }
 }
 
-function findEnvFile(startDir: string): string | null {
+export function findEnvFile(startDir: string): string | null {
+  if (process.env['GEMINI_ENV_FILE']) {
+    return process.env['GEMINI_ENV_FILE'];
+  }
+
   let currentDir = path.resolve(startDir);
   while (true) {
     // prefer gemini-specific .env under GEMINI_DIR
@@ -515,6 +528,91 @@ function findEnvFile(startDir: string): string | null {
     }
     currentDir = parentDir;
   }
+}
+
+export function findWorkspaceSettingsFile(startDir: string): string {
+  let currentDir = path.resolve(startDir);
+  const home = path.resolve(homedir());
+
+  while (true) {
+    // Check .gemini/settings.json
+    const geminiSettingsPath = path.join(currentDir, GEMINI_DIR, 'settings.json');
+    if (fs.existsSync(geminiSettingsPath)) {
+      return geminiSettingsPath;
+    }
+
+    const parentDir = path.dirname(currentDir);
+    if (parentDir === currentDir || !parentDir) {
+      break;
+    }
+    // Stop if we hit home directory (user settings are handled separately)
+    if (currentDir === home) {
+      break;
+    }
+    currentDir = parentDir;
+  }
+
+  // Fallback to the default location in the workspace root if not found elsewhere
+  // (This matches the original behavior if the file doesn't exist yet, we might want to create it there)
+  return new Storage(startDir).getWorkspaceSettingsPath();
+}
+
+export function getEnvVarOverrides(): Settings {
+  const overrides: Record<string, unknown> = {};
+  for (const key in process.env) {
+    if (key.startsWith('GEMINI_') && !AUTH_ENV_VAR_WHITELIST.includes(key)) {
+      const rawName = key.slice(7); // Remove GEMINI_
+      if (!rawName) continue;
+
+      let pathParts: string[];
+      // Support double underscore as separator for explicit nesting
+      // Example: GEMINI_GENERAL__ENABLE_AUTO_UPDATE -> general.enableAutoUpdate
+      if (rawName.includes('__')) {
+        pathParts = rawName.split('__');
+      } else {
+        // Fallback: Check if the first segment matches a known top-level section
+        // Example: GEMINI_UI_THEME -> ui.theme
+        const sections = ['GENERAL', 'UI', 'CONTEXT', 'TOOLS', 'SECURITY', 'ADMIN', 'AGENTS', 'SKILLS', 'HOOKS', 'MODEL', 'TELEMETRY', 'EXPERIMENTAL', 'MCP'];
+        const firstUnderscore = rawName.indexOf('_');
+        if (firstUnderscore !== -1) {
+           const potentialSection = rawName.substring(0, firstUnderscore);
+           if (sections.includes(potentialSection)) {
+             pathParts = [potentialSection, rawName.substring(firstUnderscore + 1)];
+           } else {
+             pathParts = [rawName];
+           }
+        } else {
+          pathParts = [rawName];
+        }
+      }
+
+      // Convert segments from SCREAMING_SNAKE_CASE to camelCase
+      const finalPath = pathParts.map(part =>
+        part.toLowerCase().replace(/_([a-z0-9])/g, (_, letter) => letter.toUpperCase())
+      ).join('.');
+
+      // Parse value
+      let value: unknown = process.env[key];
+      if (value === 'true') value = true;
+      if (value === 'false') value = false;
+      // Try parsing number
+      if (typeof value === 'string' && /^-?\d+(\.\d+)?$/.test(value)) {
+        const num = Number(value);
+        if (!isNaN(num)) value = num;
+      }
+      // Try parsing JSON (for arrays/objects)
+      if (typeof value === 'string' && (value.startsWith('[') || value.startsWith('{'))) {
+        try {
+          value = JSON.parse(value);
+        } catch (e) {
+          // ignore, keep as string
+        }
+      }
+
+      setNestedProperty(overrides, finalPath, value);
+    }
+  }
+  return overrides as Settings;
 }
 
 export function setUpCloudShellEnvironment(
@@ -646,9 +744,8 @@ export function loadSettings(
   // We expect homedir to always exist and be resolvable.
   const realHomeDir = fs.realpathSync(resolvedHomeDir);
 
-  const workspaceSettingsPath = new Storage(
-    workspaceDir,
-  ).getWorkspaceSettingsPath();
+  const workspaceSettingsPath = findWorkspaceSettingsFile(workspaceDir);
+  const userSettingsPath = process.env['GEMINI_CONFIG'] || USER_SETTINGS_PATH;
 
   const load = (filePath: string): { settings: Settings; rawJson?: string } => {
     try {
@@ -700,7 +797,7 @@ export function loadSettings(
 
   const systemResult = load(systemSettingsPath);
   const systemDefaultsResult = load(systemDefaultsPath);
-  const userResult = load(USER_SETTINGS_PATH);
+  const userResult = load(userSettingsPath);
 
   let workspaceResult: { settings: Settings; rawJson?: string } = {
     settings: {} as Settings,
@@ -716,6 +813,7 @@ export function loadSettings(
   );
   const userOriginalSettings = structuredClone(userResult.settings);
   const workspaceOriginalSettings = structuredClone(workspaceResult.settings);
+  const envOverrides = getEnvVarOverrides();
 
   // Environment variables for runtime use
   systemSettings = resolveEnvVarsInObject(systemResult.settings);
@@ -742,6 +840,7 @@ export function loadSettings(
     systemDefaultSettings,
     userSettings,
     systemSettings,
+    envOverrides,
   );
   const isTrusted =
     isWorkspaceTrusted(initialTrustCheckSettings as Settings, workspaceDir)
@@ -754,6 +853,7 @@ export function loadSettings(
     userSettings,
     workspaceSettings,
     isTrusted,
+    envOverrides,
   );
 
   // loadEnvironment depends on settings so we have to create a temp version of
@@ -787,7 +887,7 @@ export function loadSettings(
       readOnly: true,
     },
     {
-      path: USER_SETTINGS_PATH,
+      path: userSettingsPath,
       settings: userSettings,
       originalSettings: userOriginalSettings,
       rawJson: userResult.rawJson,
@@ -802,6 +902,7 @@ export function loadSettings(
     },
     isTrusted,
     settingsErrors,
+    envOverrides,
   );
 
   // Automatically migrate deprecated settings when loading.
